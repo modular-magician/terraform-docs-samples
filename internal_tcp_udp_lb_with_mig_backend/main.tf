@@ -1,27 +1,16 @@
-# Internal HTTP load balancer with a managed instance group backend
+# Internal TCP/UDP load balancer with a managed instance group backend
 
-# [START cloudloadbalancing_int_http_gce]
+# [START cloudloadbalancing_int_tcp_udp_gce]
 # VPC
 resource "google_compute_network" "ilb_network" {
-  name                    = "l7-ilb-network"
+  name                    = "l4-ilb-network"
   provider                = google-beta
   auto_create_subnetworks = false
 }
 
-# proxy-only subnet
-resource "google_compute_subnetwork" "proxy_subnet" {
-  name          = "l7-ilb-proxy-subnet"
-  provider      = google-beta
-  ip_cidr_range = "10.0.0.0/24"
-  region        = "europe-west1"
-  purpose       = "INTERNAL_HTTPS_LOAD_BALANCER"
-  role          = "ACTIVE"
-  network       = google_compute_network.ilb_network.id
-}
-
 # backed subnet
 resource "google_compute_subnetwork" "ilb_subnet" {
-  name          = "l7-ilb-subnet"
+  name          = "l4-ilb-subnet"
   provider      = google-beta
   ip_cidr_range = "10.0.1.0/24"
   region        = "europe-west1"
@@ -30,57 +19,38 @@ resource "google_compute_subnetwork" "ilb_subnet" {
 
 # forwarding rule
 resource "google_compute_forwarding_rule" "google_compute_forwarding_rule" {
-  name                  = "l7-ilb-forwarding-rule"
+  name                  = "l4-ilb-forwarding-rule"
+  backend_service       = google_compute_region_backend_service.default.id
   provider              = google-beta
   region                = "europe-west1"
-  depends_on            = [google_compute_subnetwork.proxy_subnet]
   ip_protocol           = "TCP"
-  load_balancing_scheme = "INTERNAL_MANAGED"
-  port_range            = "80"
-  target                = google_compute_region_target_http_proxy.default.id
+  load_balancing_scheme = "INTERNAL"
+  all_ports             = true
+  allow_global_access   = true
   network               = google_compute_network.ilb_network.id
   subnetwork            = google_compute_subnetwork.ilb_subnet.id
-  network_tier          = "PREMIUM"
-}
-
-# http proxy
-resource "google_compute_region_target_http_proxy" "default" {
-  name     = "l7-ilb-target-http-proxy"
-  provider = google-beta
-  region   = "europe-west1"
-  url_map  = google_compute_region_url_map.default.id
-}
-
-# url map
-resource "google_compute_region_url_map" "default" {
-  name            = "l7-ilb-regional-url-map"
-  provider        = google-beta
-  region          = "europe-west1"
-  default_service = google_compute_region_backend_service.default.id
 }
 
 # backend service
 resource "google_compute_region_backend_service" "default" {
-  name                  = "l7-ilb-backend-subnet"
+  name                  = "l4-ilb-backend-subnet"
   provider              = google-beta
   region                = "europe-west1"
-  protocol              = "HTTP"
-  load_balancing_scheme = "INTERNAL_MANAGED"
-  timeout_sec           = 10
+  protocol              = "TCP"
+  load_balancing_scheme = "INTERNAL"
   health_checks         = [google_compute_region_health_check.default.id]
   backend {
     group           = google_compute_region_instance_group_manager.mig.instance_group
-    balancing_mode  = "UTILIZATION"
-    capacity_scaler = 1.0
+    balancing_mode  = "CONNECTION"
   }
 }
 
 # instance template
 resource "google_compute_instance_template" "instance_template" {
-  name         = "l7-ilb-mig-template"
+  name         = "l4-ilb-mig-template"
   provider     = google-beta
   machine_type = "e2-small"
-  tags         = ["http-server"]
+  tags         = ["allow-ssh","allow-health-check"]
 
   network_interface {
     network    = google_compute_network.ilb_network.id
@@ -125,17 +95,17 @@ resource "google_compute_instance_template" "instance_template" {
 
 # health check
 resource "google_compute_region_health_check" "default" {
-  name     = "l7-ilb-hc"
+  name     = "l4-ilb-hc"
   provider = google-beta
   region   = "europe-west1"
   http_health_check {
-    port_specification = "USE_SERVING_PORT"
+    port = "80"
   }
 }
 
 # MIG
 resource "google_compute_region_instance_group_manager" "mig" {
-  name     = "l7-ilb-mig1"
+  name     = "l4-ilb-mig1"
   provider = google-beta
   region   = "europe-west1"
   version {
@@ -146,9 +116,9 @@ resource "google_compute_region_instance_group_manager" "mig" {
   target_size        = 2
 }
 
-# allow all access from IAP and health check ranges
-resource "google_compute_firewall" "fw-iap" {
-  name          = ""
+# allow all access from health check ranges
+resource "google_compute_firewall" "fw_hc" {
+  name          = "l4-ilb-fw-allow-hc"
   provider      = google-beta
   direction     = "INGRESS"
   network       = google_compute_network.ilb_network.id
@@ -156,25 +126,43 @@ resource "google_compute_firewall" "fw-iap" {
   allow {
     protocol = "tcp"
   }
+  source_tags = ["allow-health-check"]
 }
 
-# allow http from proxy subnet to backends
-resource "google_compute_firewall" "fw-ilb-to-backends" {
-  name          = "l7-ilb-fw-allow-ilb-to-backends"
+# allow communication within the subnet 
+resource "google_compute_firewall" "fw_ilb_to_backends" {
+  name          = "l4-ilb-fw-allow-ilb-to-backends"
   provider      = google-beta
   direction     = "INGRESS"
   network       = google_compute_network.ilb_network.id
-  source_ranges = ["10.0.0.0/24"]
-  target_tags   = ["http-server"]
+  source_ranges = ["10.0.1.0/24"]
   allow {
     protocol = "tcp"
-    ports    = ["80", "443", "8080"]
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
   }
 }
 
+# allow SSH
+resource "google_compute_firewall" "fw_ilb_ssh" {
+  name          = "l4-ilb-fw-ssh"
+  provider      = google-beta
+  direction     = "INGRESS"
+  network       = google_compute_network.ilb_network.id
+  allow {
+    protocol = "tcp"
+    ports = ["22"]
+  }
+  source_tags = ["allow-ssh"]
+}
+
 # test instance
-resource "google_compute_instance" "vm-test" {
-  name         = "l7-ilb-test-vm"
+resource "google_compute_instance" "vm_test" {
+  name         = "l4-ilb-test-vm"
   provider     = google-beta
   zone         = "europe-west1-b"
   machine_type = "e2-small"
@@ -188,4 +176,4 @@ resource "google_compute_instance" "vm-test" {
     }
   }
 }
-# [END cloudloadbalancing_int_http_gce]
+# [END cloudloadbalancing_int_tcp_udp_gce]
